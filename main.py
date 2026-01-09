@@ -3,128 +3,163 @@ import requests
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Header, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 
-app = FastAPI()
-
-# ===== ENV =====
+# =========================
+# ENV VARS
+# =========================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 KLAVIYO_API_KEY = os.getenv("KLAVIYO_API_KEY")
 CIO_SITE_ID = os.getenv("CIO_SITE_ID")
 CIO_API_KEY = os.getenv("CIO_API_KEY")
 
-KLAVIYO_REVISION = "2024-10-15"
+# =========================
+# FASTAPI
+# =========================
+app = FastAPI()
 
 
-# ===== MODELS =====
-class Payload(BaseModel):
+# =========================
+# MODELS
+# =========================
+class WebhookPayload(BaseModel):
     customer_id: str
     email: str
-    klaviyo_id: Optional[str] = None
+    klaviyo_id: str | None = None
 
 
-# ===== HELPERS =====
-def klaviyo_headers():
-    return {
-        "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
-        "Accept": "application/json",
-        "revision": KLAVIYO_REVISION,
-    }
+# =========================
+# HELPERS
+# =========================
+def is_mock_mode() -> bool:
+    return KLAVIYO_API_KEY in (None, "", "test")
 
 
-def get_klaviyo_profile_by_id(klaviyo_id: str):
-    url = f"https://a.klaviyo.com/api/profiles/{klaviyo_id}"
-    r = requests.get(url, headers=klaviyo_headers(), timeout=20)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    return r.json().get("data")
-
-
-def get_klaviyo_profile_by_email(email: str):
+def get_klaviyo_profile_by_email(email: str) -> dict | None:
     url = "https://a.klaviyo.com/api/profiles/"
-    params = {
-        "filter": f"equals(email,'{email}')",
-        "page[size]": 1,
+    headers = {
+        "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+        "revision": "2024-10-15",
     }
-    r = requests.get(url, headers=klaviyo_headers(), params=params, timeout=20)
+    params = {
+        "filter": f"equals(email,'{email}')"
+    }
+
+    r = requests.get(url, headers=headers, params=params, timeout=10)
     r.raise_for_status()
+
     data = r.json().get("data", [])
     return data[0] if data else None
 
 
+def get_klaviyo_profile_by_id(klaviyo_id: str) -> dict | None:
+    url = f"https://a.klaviyo.com/api/profiles/{klaviyo_id}"
+    headers = {
+        "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+        "revision": "2024-10-15",
+    }
+
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json().get("data")
+
+
 def update_customerio(customer_id: str, attributes: dict):
     url = f"https://track.customer.io/api/v1/customers/{customer_id}"
-    payload = {"attributes": attributes}
-    r = requests.put(url, json=payload, auth=(CIO_SITE_ID, CIO_API_KEY), timeout=20)
+    r = requests.put(
+        url,
+        auth=(CIO_SITE_ID, CIO_API_KEY),
+        json={"attributes": attributes},
+        timeout=10,
+    )
     r.raise_for_status()
 
 
-# ===== WEBHOOK =====
+# =========================
+# WEBHOOK
+# =========================
 @app.post("/webhook")
 async def webhook(
+    payload: WebhookPayload,
     request: Request,
-    payload: Payload,
     x_webhook_secret: str = Header(None),
 ):
-    # Security
-    if x_webhook_secret != WEBHOOK_SECRET:
+    # ---- Auth ----
+    if not WEBHOOK_SECRET or x_webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not KLAVIYO_API_KEY or not CIO_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing API keys")
 
     customer_id = payload.customer_id
     email = payload.email
     klaviyo_id = payload.klaviyo_id
-# ===== LOCAL MOCK =====
-if KLAVIYO_API_KEY == "test":
-    attrs = {
-        "klaviyo_id": "MOCK_KLAVIYO_ID",
-        "klaviyo_last_active_at": "2026-01-08T21:30:00Z",
-        "klaviyo_last_synced_at": datetime.now(timezone.utc).isoformat(),
-        "klaviyo_sync_status": "mocked_local",
-    }
 
-    # Evita llamar a Customer.io si también está mockeado
-    if CIO_API_KEY != "test":
-        update_customerio(customer_id, attrs)
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    return {
-        "status": "ok",
-        "mode": "local_mock",
-        "attributes_written": attrs,
-    }
-
-    # Resolve Klaviyo profile
-    profile = None
-    if klaviyo_id:
-        profile = get_klaviyo_profile_by_id(klaviyo_id)
-
-    if not profile:
-        profile = get_klaviyo_profile_by_email(email)
-
-    if not profile:
+    # =========================
+    # MOCK MODE (LOCAL / TEST)
+    # =========================
+    if is_mock_mode():
         update_customerio(customer_id, {
-            "klaviyo_sync_status": "profile_not_found",
-            "klaviyo_last_synced_at": datetime.now(timezone.utc).isoformat(),
+            "klaviyo_sync_status": "mock_success",
+            "klaviyo_last_active": now_iso,
+            "klaviyo_last_synced_at": now_iso,
         })
-        return {"status": "profile_not_found"}
 
-    klaviyo_id = profile["id"]
-    last_active = profile.get("attributes", {}).get("last_active_at")
+        return {
+            "status": "ok",
+            "mode": "mock"
+        }
 
-    attrs = {
-        "klaviyo_id": klaviyo_id,
-        "klaviyo_last_synced_at": datetime.now(timezone.utc).isoformat(),
-    }
+    # =========================
+    # REAL KLAVIYO MODE
+    # =========================
+    try:
+        profile = None
 
-    if last_active:
-        attrs["klaviyo_last_active_at"] = last_active
-        attrs["klaviyo_sync_status"] = "success"
-    else:
-        attrs["klaviyo_sync_status"] = "no_last_active"
+        if klaviyo_id:
+            profile = get_klaviyo_profile_by_id(klaviyo_id)
 
-    update_customerio(customer_id, attrs)
+        if not profile:
+            profile = get_klaviyo_profile_by_email(email)
 
-    return {"status": "ok"}
+        if not profile:
+            update_customerio(customer_id, {
+                "klaviyo_sync_status": "not_found",
+                "klaviyo_last_synced_at": now_iso,
+            })
+
+            return {
+                "status": "ok",
+                "reason": "profile_not_found"
+            }
+
+        last_active = (
+            profile
+            .get("attributes", {})
+            .get("last_active")
+        )
+
+        update_customerio(customer_id, {
+            "klaviyo_sync_status": "success",
+            "klaviyo_last_active": last_active,
+            "klaviyo_last_synced_at": now_iso,
+        })
+
+        return {
+            "status": "ok",
+            "mode": "production"
+        }
+
+    # =========================
+    # ERROR SAFETY NET
+    # =========================
+    except Exception as e:
+        update_customerio(customer_id, {
+            "klaviyo_sync_status": "error_klaviyo_api",
+            "klaviyo_last_synced_at": now_iso,
+            "klaviyo_error_message": str(e)[:255],
+        })
+
+        return {
+            "status": "error",
+            "reason": "klaviyo_api_error"
+        }
+
