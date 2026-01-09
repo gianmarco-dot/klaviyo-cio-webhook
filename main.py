@@ -77,6 +77,24 @@ async def webhook(
     customer_id = payload.customer_id
     email = payload.email
     klaviyo_id = payload.klaviyo_id
+# ===== LOCAL MOCK =====
+if KLAVIYO_API_KEY == "test":
+    attrs = {
+        "klaviyo_id": "MOCK_KLAVIYO_ID",
+        "klaviyo_last_active_at": "2026-01-08T21:30:00Z",
+        "klaviyo_last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "klaviyo_sync_status": "mocked_local",
+    }
+
+    # Evita llamar a Customer.io si también está mockeado
+    if CIO_API_KEY != "test":
+        update_customerio(customer_id, attrs)
+
+    return {
+        "status": "ok",
+        "mode": "local_mock",
+        "attributes_written": attrs,
+    }
 
     # Resolve Klaviyo profile
     profile = None
