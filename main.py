@@ -4,27 +4,44 @@ import os
 import requests
 import traceback
 from dateutil import parser
+from datetime import datetime, timezone
 
 app = FastAPI()
 
+# =========================
+# ENV VARS
+# =========================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 KLAVIYO_API_KEY = os.getenv("KLAVIYO_API_KEY")
 CIO_SITE_ID = os.getenv("CIO_SITE_ID")
 CIO_API_KEY = os.getenv("CIO_API_KEY")
 MOCK_MODE = os.getenv("MOCK_MODE", "true") == "true"
 
-
+# =========================
+# KLAVIYO HELPERS
+# =========================
 def get_klaviyo_last_active(email: str):
-    url = "https://a.klaviyo.com/api/profiles/"
+    """
+    Uses Klaviyo official profile-search endpoint
+    Returns last_active (string) or None
+    """
+    url = "https://a.klaviyo.com/api/profile-search/"
     headers = {
         "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
-        "Accept": "application/json"
-    }
-    params = {
-        "filter": f"equals(email,\"{email}\")"
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
-    r = requests.get(url, headers=headers, params=params, timeout=10)
+    payload = {
+        "data": {
+            "type": "profile-search",
+            "attributes": {
+                "email": email
+            }
+        }
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=10)
     r.raise_for_status()
 
     data = r.json().get("data", [])
@@ -32,34 +49,42 @@ def get_klaviyo_last_active(email: str):
         return None
 
     profile = data[0]
-    last_active = profile["attributes"].get("last_active")
-    return last_active
+    return profile.get("attributes", {}).get("last_active")
 
 
-def update_customer_io(customer_id: str, last_active_iso: str):
+# =========================
+# CUSTOMER.IO HELPERS
+# =========================
+def update_customer_io(customer_id: str, attributes: dict):
     url = f"https://track.customer.io/api/v1/customers/{customer_id}"
     auth = (CIO_SITE_ID, CIO_API_KEY)
-    payload = {
-        "last_active_klaviyo": last_active_iso
-    }
 
-    r = requests.put(url, auth=auth, json=payload, timeout=10)
+    r = requests.put(
+        url,
+        auth=auth,
+        json=attributes,
+        timeout=10,
+    )
     r.raise_for_status()
 
 
+# =========================
+# WEBHOOK
+# =========================
 @app.post("/webhook")
 async def webhook(
     request: Request,
     x_webhook_secret: str = Header(None)
 ):
     try:
-        # 1. Auth
+        # -------- AUTH --------
         if not WEBHOOK_SECRET:
             raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
         if x_webhook_secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+        # -------- PAYLOAD --------
         payload = await request.json()
         customer_id = payload.get("customer_id")
         email = payload.get("email")
@@ -70,35 +95,46 @@ async def webhook(
                 detail="customer_id and email are required"
             )
 
-        # 2. MOCK
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # -------- MOCK MODE --------
         if MOCK_MODE:
             return {
                 "status": "ok",
                 "mode": "mock",
                 "customer_id": customer_id,
-                "email": email
+                "email": email,
             }
 
-        # 3. Klaviyo lookup
+        # -------- KLAVIYO LOOKUP --------
         last_active_raw = get_klaviyo_last_active(email)
 
         if not last_active_raw:
+            update_customer_io(customer_id, {
+                "klaviyo_sync_status": "not_found",
+                "klaviyo_last_synced_at": now_iso,
+            })
+
             return {
                 "status": "ok",
                 "message": "No Klaviyo last_active found",
-                "customer_id": customer_id
+                "customer_id": customer_id,
             }
 
-        # 4. Normalize date → ISO 8601
+        # -------- NORMALIZE DATE --------
         last_active_iso = parser.parse(last_active_raw).isoformat()
 
-        # 5. Update Customer.io
-        update_customer_io(customer_id, last_active_iso)
+        # -------- UPDATE CUSTOMER.IO --------
+        update_customer_io(customer_id, {
+            "last_active_klaviyo": last_active_iso,
+            "klaviyo_sync_status": "success",
+            "klaviyo_last_synced_at": now_iso,
+        })
 
         return {
             "status": "ok",
             "customer_id": customer_id,
-            "last_active": last_active_iso
+            "last_active": last_active_iso,
         }
 
     except HTTPException as e:
@@ -107,15 +143,19 @@ async def webhook(
     except Exception as e:
         print("🔥 UNHANDLED ERROR")
         traceback.print_exc()
+
         return JSONResponse(
             status_code=500,
             content={
                 "status": "error",
-                "message": str(e)
-            }
+                "message": str(e),
+            },
         )
 
 
+# =========================
+# HEALTHCHECK
+# =========================
 @app.get("/")
 def health():
     return {"status": "ok"}
