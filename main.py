@@ -6,27 +6,45 @@ import traceback
 
 app = FastAPI()
 
+# =========================
+# ENV VARS
+# =========================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 KLAVIYO_API_KEY = os.getenv("KLAVIYO_API_KEY")
 
-KLAVIYO_BASE_URL = "https://a.klaviyo.com/api/profiles/"
-KLAVIYO_REVISION = "2024-02-15"
+if not KLAVIYO_API_KEY:
+    print("⚠️ KLAVIYO_API_KEY not set")
 
+KlaviyoHeaders = {
+    "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
+    "Accept": "application/json",
+    "Revision": "2024-02-15"
+}
 
+# =========================
+# HEALTHCHECK
+# =========================
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+# =========================
+# WEBHOOK
+# =========================
 @app.post("/webhook")
 async def webhook(
     request: Request,
     x_webhook_secret: str = Header(None)
 ):
     try:
-        # 1️⃣ Auth
+        # ---- AUTH ----
         if not WEBHOOK_SECRET:
-            raise HTTPException(status_code=500, detail="Webhook secret not configured")
+            raise HTTPException(status_code=500, detail="WEBHOOK_SECRET not configured")
 
         if x_webhook_secret != WEBHOOK_SECRET:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-        # 2️⃣ Parse body
+        # ---- BODY ----
         payload = await request.json()
         customer_id = payload.get("customer_id")
         email = payload.get("email")
@@ -37,44 +55,30 @@ async def webhook(
                 detail="customer_id and email are required"
             )
 
-        # 3️⃣ Call Klaviyo — lookup by email
-        headers = {
-            "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
-            "Accept": "application/json",
-            "Revision": KLAVIYO_REVISION
-        }
-
-        params = {
-            "filter": f'equals(email,"{email}")'
-        }
-
-        response = requests.get(
-            KLAVIYO_BASE_URL,
-            headers=headers,
-            params=params,
-            timeout=10
+        # ---- 1. SEARCH PROFILE BY EMAIL ----
+        search_url = (
+            "https://a.klaviyo.com/api/profiles/"
+            f"?filter=equals(email,\"{email}\")"
         )
 
-        response.raise_for_status()
-        data = response.json().get("data", [])
+        profile_resp = requests.get(search_url, headers=KlaviyoHeaders, timeout=10)
+        profile_resp.raise_for_status()
+        profile_data = profile_resp.json()
 
-        # 4️⃣ Handle no profile found
-        if not data:
-            return {
-                "status": "ok",
-                "customer_id": customer_id,
-                "email": email,
-                "klaviyo_id": None,
-                "last_active": None
-            }
+        if not profile_data.get("data"):
+            raise HTTPException(
+                status_code=404,
+                detail="Klaviyo profile not found"
+            )
 
-        # 5️⃣ Extract Klaviyo profile
-        profile = data[0]
-        klaviyo_id = profile.get("id")
-        attributes = profile.get("attributes", {})
-        last_active = attributes.get("last_active")
+        profile = profile_data["data"][0]
+        klaviyo_id = profile["id"]
+        attributes = profile["attributes"]
 
-        # 6️⃣ Return (Customer.io update comes later)
+        # 🔑 ESTE ES EL CAMPO CORRECTO
+        last_active = attributes.get("last_event_date")
+
+        # ---- RESPONSE ----
         return {
             "status": "ok",
             "customer_id": customer_id,
@@ -97,9 +101,4 @@ async def webhook(
                 "message": str(e)
             }
         )
-
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
 
